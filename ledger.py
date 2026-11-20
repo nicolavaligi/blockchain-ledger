@@ -2,14 +2,18 @@
 
 import argparse
 import hashlib
+import os
 import sqlite3
 import struct
 import sys
 import time
 from contextlib import closing
 from pathlib import Path
+from subprocess import TimeoutExpired
+from tempfile import TemporaryDirectory
 
 import checkpoint
+import signatures
 
 GENESIS_PARENT = bytes(32)
 MAX_PAYLOAD = 1024 * 1024
@@ -24,18 +28,28 @@ CREATE TABLE IF NOT EXISTS blocks (
 """
 
 
-def block_hash(height, created_ns, parent, payload):
-    digest = hashlib.sha256(b"blockchain-ledger:v1\0")
+def block_hash(height, created_ns, parent, payload, kind=0):
+    domain = b"blockchain-ledger:file-sha256:v1\0" if kind else b"blockchain-ledger:v1\0"
+    digest = hashlib.sha256(domain)
     digest.update(struct.pack(">QQ", height, created_ns))
     digest.update(parent)
     digest.update(payload)
     return digest.digest()
 
 
-def append(db, payloads):
+def has_kind(db):
+    return any(row[1] == "kind" for row in db.execute("PRAGMA table_info(blocks)"))
+
+
+def append(db, payloads, *, fingerprints=False):
     """Atomically append a batch and return its final height and digest."""
     db.execute("BEGIN IMMEDIATE")
     with db:
+        typed = has_kind(db)
+        if fingerprints and not typed:
+            db.execute("ALTER TABLE blocks ADD COLUMN kind INTEGER NOT NULL DEFAULT 0 "
+                       "CHECK (kind IN (0, 1))")
+            typed = True
         tip = db.execute(
             "SELECT height, digest FROM blocks ORDER BY height DESC LIMIT 1"
         ).fetchone()
@@ -44,44 +58,123 @@ def append(db, payloads):
         for payload in payloads:
             if not isinstance(payload, bytes) or len(payload) > MAX_PAYLOAD:
                 raise ValueError("Il payload deve essere in byte e al massimo di 1 MiB.")
+            if fingerprints and len(payload) != 32:
+                raise ValueError("L'impronta deve contenere 32 byte.")
             added = True
             height += 1
             created_ns = time.time_ns()
-            digest = block_hash(height, created_ns, parent, payload)
-            db.execute(
-                "INSERT INTO blocks VALUES (?, ?, ?, ?, ?)",
-                (height, created_ns, parent, payload, digest),
-            )
+            digest = block_hash(height, created_ns, parent, payload, fingerprints)
+            row = (height, created_ns, parent, payload, digest)
+            if typed:
+                db.execute("INSERT INTO blocks VALUES (?, ?, ?, ?, ?, ?)", (*row, int(fingerprints)))
+            else:
+                db.execute("INSERT INTO blocks VALUES (?, ?, ?, ?, ?)", row)
             parent = digest
         if not added:
             raise ValueError("Il lotto deve contenere almeno un payload.")
     return height, parent
 
 
-def verify(db, expected_tip=None):
+def verify(db, expected_tip=None, *, anchor=None, allow_extension=False, fingerprint=None):
     """Check one SQLite read snapshot and optionally compare a trusted tip."""
     parent = GENESIS_PARENT
     count = 0
+    kind_column = "kind" if has_kind(db) else "0"
     rows = db.execute(
-        "SELECT height, created_ns, parent, payload, digest FROM blocks ORDER BY height"
+        f"SELECT height, created_ns, parent, payload, digest, {kind_column} "
+        "FROM blocks ORDER BY height"
     )
+    found = False
     with closing(rows):
-        for height, created_ns, stored_parent, payload, digest in rows:
+        for height, created_ns, stored_parent, payload, digest, kind in rows:
             if (
                 height != count
                 or type(created_ns) is not int
                 or created_ns < 0
                 or not isinstance(payload, bytes)
                 or len(payload) > MAX_PAYLOAD
+                or type(kind) is not int
+                or kind not in (0, 1)
+                or (kind == 1 and len(payload) != 32)
                 or stored_parent != parent
-                or digest != block_hash(height, created_ns, parent, payload)
+                or digest != block_hash(height, created_ns, parent, payload, kind)
             ):
                 raise ValueError(f"Blocco non valido alla posizione {count}.")
             count += 1
             parent = digest
+            if anchor is not None and count == anchor[0] and digest != anchor[1]:
+                raise ValueError("Il prefisso differisce dal checkpoint fidato.")
+            if kind == 1 and fingerprint is not None and payload == fingerprint:
+                found = True
+    if anchor is not None and (count < anchor[0] or (not allow_extension and count != anchor[0])):
+        raise ValueError("Il numero di blocchi differisce dal checkpoint fidato.")
+    if fingerprint is not None and not found:
+        raise ValueError("Impronta assente dal registro.")
     if expected_tip is not None and (not count or parent != expected_tip):
         raise ValueError("L'hash finale differisce dal checkpoint fidato.")
     return count, parent if count else None
+
+
+def read_only(path):
+    db = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA trusted_schema = OFF")
+    except sqlite3.Error:
+        db.close()
+        raise
+    return db
+
+
+def fingerprint_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(MAX_PAYLOAD), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def verified_copy(source, destination, anchor):
+    destination = Path(destination).absolute()
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        if os.path.lexists(str(destination) + suffix):
+            raise FileExistsError(f"Destinazione già occupata: {destination}{suffix}")
+    with TemporaryDirectory(dir=destination.parent) as directory:
+        staging = Path(directory) / "snapshot.db"
+        with closing(read_only(source)) as original, closing(sqlite3.connect(staging)) as copied:
+            original.backup(copied)
+            copied.execute("PRAGMA trusted_schema = OFF")
+            copied.execute("PRAGMA journal_mode = DELETE")
+            if copied.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise ValueError("Controllo di integrità SQLite fallito.")
+            result = verify(copied, anchor=anchor)
+        staging.chmod(0o600)
+        with staging.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.link(staging, destination)
+    return result
+
+
+def authentication(parser, *, required=False, include_tip=False):
+    tokens = parser.add_mutually_exclusive_group(required=required)
+    tokens.add_argument("--checkpoint", help="Checkpoint HMAC.")
+    tokens.add_argument("--signed-checkpoint", help="Checkpoint Ed25519.")
+    if include_tip:
+        tokens.add_argument("--tip", help="SHA-256 finale salvato separatamente.")
+    keys = parser.add_mutually_exclusive_group()
+    keys.add_argument("--key-file", help="Chiave HMAC.")
+    keys.add_argument("--public-key", help="Chiave pubblica Ed25519 DER.")
+
+
+def get_anchor(parser, args):
+    if (args.checkpoint is None) != (args.key_file is None):
+        parser.error("--checkpoint e --key-file devono essere usati insieme.")
+    if (args.signed_checkpoint is None) != (args.public_key is None):
+        parser.error("--signed-checkpoint e --public-key devono essere usati insieme.")
+    if args.checkpoint is not None:
+        return checkpoint.unseal(args.checkpoint, checkpoint.read_key(args.key_file))
+    if args.signed_checkpoint is not None:
+        return signatures.unseal(args.signed_checkpoint, args.public_key)
+    return None
 
 
 def read_payload(path):
@@ -96,49 +189,71 @@ def main():
     add = commands.add_parser("append", help="Aggiunge un blocco per file.")
     add.add_argument("files", nargs="+")
     check = commands.add_parser("verify", help="Controlla la catena.")
-    expected = check.add_mutually_exclusive_group()
-    expected.add_argument("--tip", help="SHA-256 finale salvato separatamente.")
-    expected.add_argument("--checkpoint", help="Checkpoint autenticato da verificare.")
-    check.add_argument("--key-file", help="File con la chiave del checkpoint.")
+    add.add_argument("--hash-only", action="store_true", help="Registra solo SHA-256 dei file.")
+    authentication(check, include_tip=True)
+    check.add_argument("--allow-extension", action="store_true", help="Accetta blocchi successivi.")
+    check.add_argument("--file", help="Cerca l'impronta del file nella catena verificata.")
     attest = commands.add_parser("checkpoint", help="Autentica lo stato corrente del registro.")
-    attest.add_argument("--key-file", required=True)
+    signing = attest.add_mutually_exclusive_group(required=True)
+    signing.add_argument("--key-file")
+    signing.add_argument("--private-key")
     keygen = commands.add_parser("keygen", help="Genera una chiave per i checkpoint.")
-    keygen.add_argument("--key-file", required=True)
+    generation = keygen.add_mutually_exclusive_group(required=True)
+    generation.add_argument("--key-file")
+    generation.add_argument("--private-key")
+    public = commands.add_parser("export-public", help="Esporta la chiave pubblica Ed25519.")
+    public.add_argument("--private-key", required=True)
+    public.add_argument("--public-key", required=True)
+    backup = commands.add_parser("backup", help="Crea una copia verificata in DESTINATION.")
+    backup.add_argument("destination")
+    restore = commands.add_parser("restore", help="Ripristina BACKUP nel nuovo file --db.")
+    restore.add_argument("backup")
+    for command in (backup, restore):
+        authentication(command, required=True)
     args = parser.parse_args()
-    if args.command == "verify" and (args.checkpoint is None) != (args.key_file is None):
-        parser.error("--checkpoint e --key-file devono essere usati insieme.")
 
     try:
         if args.command == "keygen":
-            checkpoint.create_key(args.key_file)
+            if args.private_key is not None:
+                signatures.generate(args.private_key)
+            else:
+                checkpoint.create_key(args.key_file)
+        elif args.command == "export-public":
+            signatures.export_public(args.private_key, args.public_key)
         elif args.command == "append":
+            load = fingerprint_file if args.hash_only else read_payload
             with closing(sqlite3.connect(args.db)) as db:
                 db.execute(SCHEMA)
-                height, digest = append(db, (read_payload(path) for path in args.files))
+                height, digest = append(db, (load(path) for path in args.files),
+                                        fingerprints=args.hash_only)
             print(f"height={height} tip={digest.hex()}")
-        else:
-            expected_count = None
-            expected_tip = None
-            if args.command == "checkpoint":
-                key = checkpoint.read_key(args.key_file)
-            elif args.checkpoint is not None:
-                key = checkpoint.read_key(args.key_file)
-                expected_count, expected_tip = checkpoint.unseal(args.checkpoint, key)
-            elif args.tip is not None:
-                expected_tip = bytes.fromhex(args.tip)
-                if len(expected_tip) != 32:
-                    raise ValueError("Il checkpoint SHA-256 deve contenere 32 byte.")
-
-            uri = Path(args.db).resolve().as_uri() + "?mode=ro"
-            with closing(sqlite3.connect(uri, uri=True)) as db:
-                count, digest = verify(db, expected_tip)
-            if expected_count is not None and expected_count != count:
-                raise ValueError("Il numero di blocchi differisce dal checkpoint autenticato.")
-            if args.command == "checkpoint":
-                print(checkpoint.seal(count, digest, key))
+        elif args.command == "checkpoint":
+            with closing(read_only(args.db)) as db:
+                count, digest = verify(db)
+            if args.private_key is not None:
+                print(signatures.seal(count, digest, args.private_key))
             else:
-                print(f"blocks={count} tip={digest.hex() if digest else '-'}")
-    except (OSError, ValueError, sqlite3.Error) as error:
+                print(checkpoint.seal(count, digest, checkpoint.read_key(args.key_file)))
+        else:
+            anchor = get_anchor(parser, args)
+            if args.command == "backup":
+                count, digest = verified_copy(args.db, args.destination, anchor)
+            elif args.command == "restore":
+                count, digest = verified_copy(args.backup, args.db, anchor)
+            else:
+                if args.allow_extension and anchor is None:
+                    parser.error("--allow-extension richiede un checkpoint autenticato.")
+                tip = bytes.fromhex(args.tip) if args.tip is not None else None
+                if tip is not None and len(tip) != 32:
+                    raise ValueError("L'hash finale SHA-256 deve contenere 32 byte.")
+                fingerprint = fingerprint_file(args.file) if args.file is not None else None
+                with closing(read_only(args.db)) as db:
+                    count, digest = verify(db, tip, anchor=anchor,
+                                           allow_extension=args.allow_extension, fingerprint=fingerprint)
+                if fingerprint is not None:
+                    print(f"fingerprint={fingerprint.hex()}")
+            print(f"blocks={count} tip={digest.hex() if digest else '-'}")
+    except (OSError, ValueError, sqlite3.Error, TimeoutExpired) as error:
         print(error, file=sys.stderr)
         return 1
     return 0
