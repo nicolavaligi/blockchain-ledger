@@ -7,6 +7,9 @@ import struct
 import sys
 import time
 from contextlib import closing
+from pathlib import Path
+
+import checkpoint
 
 GENESIS_PARENT = bytes(32)
 MAX_PAYLOAD = 1024 * 1024
@@ -93,25 +96,48 @@ def main():
     add = commands.add_parser("append", help="Aggiunge un blocco per file.")
     add.add_argument("files", nargs="+")
     check = commands.add_parser("verify", help="Controlla la catena.")
-    check.add_argument("--tip", help="SHA-256 finale salvato separatamente.")
+    expected = check.add_mutually_exclusive_group()
+    expected.add_argument("--tip", help="SHA-256 finale salvato separatamente.")
+    expected.add_argument("--checkpoint", help="Checkpoint autenticato da verificare.")
+    check.add_argument("--key-file", help="File con la chiave del checkpoint.")
+    attest = commands.add_parser("checkpoint", help="Autentica lo stato corrente del registro.")
+    attest.add_argument("--key-file", required=True)
+    keygen = commands.add_parser("keygen", help="Genera una chiave per i checkpoint.")
+    keygen.add_argument("--key-file", required=True)
     args = parser.parse_args()
+    if args.command == "verify" and (args.checkpoint is None) != (args.key_file is None):
+        parser.error("--checkpoint e --key-file devono essere usati insieme.")
 
     try:
-        if args.command == "append":
+        if args.command == "keygen":
+            checkpoint.create_key(args.key_file)
+        elif args.command == "append":
             with closing(sqlite3.connect(args.db)) as db:
                 db.execute(SCHEMA)
                 height, digest = append(db, (read_payload(path) for path in args.files))
             print(f"height={height} tip={digest.hex()}")
         else:
-            from pathlib import Path
+            expected_count = None
+            expected_tip = None
+            if args.command == "checkpoint":
+                key = checkpoint.read_key(args.key_file)
+            elif args.checkpoint is not None:
+                key = checkpoint.read_key(args.key_file)
+                expected_count, expected_tip = checkpoint.unseal(args.checkpoint, key)
+            elif args.tip is not None:
+                expected_tip = bytes.fromhex(args.tip)
+                if len(expected_tip) != 32:
+                    raise ValueError("Il checkpoint SHA-256 deve contenere 32 byte.")
 
-            expected = bytes.fromhex(args.tip) if args.tip is not None else None
-            if expected is not None and len(expected) != 32:
-                raise ValueError("Il checkpoint SHA-256 deve contenere 32 byte.")
             uri = Path(args.db).resolve().as_uri() + "?mode=ro"
             with closing(sqlite3.connect(uri, uri=True)) as db:
-                count, digest = verify(db, expected)
-            print(f"blocks={count} tip={digest.hex() if digest else '-'}")
+                count, digest = verify(db, expected_tip)
+            if expected_count is not None and expected_count != count:
+                raise ValueError("Il numero di blocchi differisce dal checkpoint autenticato.")
+            if args.command == "checkpoint":
+                print(checkpoint.seal(count, digest, key))
+            else:
+                print(f"blocks={count} tip={digest.hex() if digest else '-'}")
     except (OSError, ValueError, sqlite3.Error) as error:
         print(error, file=sys.stderr)
         return 1

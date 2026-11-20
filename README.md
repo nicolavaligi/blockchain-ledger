@@ -43,3 +43,27 @@ Questo progetto implementa un registro locale a singolo database. Il contenuto
 catena. Un checkpoint conservato separatamente consente di rilevare anche
 la riscrittura completa e il troncamento dello stato attestato. Il progetto
 opera senza rete peer-to-peer, consenso distribuito, firme o criptovalute.
+
+## Checkpoint autenticati
+
+Genera una chiave HMAC-SHA-256 in un percorso protetto separato dal database.
+Il comando crea il file con permessi `0600` sui sistemi POSIX e rifiuta di
+sovrascrivere un file esistente. Usa una chiave distinta per ciascun registro.
+
+```sh
+python3 ledger.py keygen --key-file /percorso/protetto/registro.key
+checkpoint=$(python3 ledger.py --db registro.db checkpoint --key-file /percorso/protetto/registro.key)
+python3 ledger.py --db registro.db verify --checkpoint "$checkpoint" --key-file /percorso/protetto/registro.key
+```
+
+Il comando `checkpoint` verifica la catena e autentica un'istantanea non vuota.
+Il token contiene il numero di blocchi, l'hash finale e un codice HMAC. La
+verifica controlla il codice HMAC prima di leggere il database e richiede che
+l'istantanea coincida esattamente con il token. Un nuovo lotto produce quindi
+uno stato da attestare con un nuovo checkpoint.
+
+L'attestazione richiede fiducia nello stato al momento della creazione del
+checkpoint. Chi possiede la chiave può creare checkpoint validi e chi può
+sostituire il token può riproporre un checkpoint precedente. Conserva quindi
+l'ultimo checkpoint atteso in una posizione fidata e tieni la chiave fuori dal
+repository e dal database. I payload restano memorizzati in chiaro.
