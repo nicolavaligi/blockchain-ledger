@@ -1,5 +1,8 @@
 import io
+import json
 import os
+import sqlite3
+import subprocess
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -7,6 +10,7 @@ from tempfile import TemporaryDirectory
 
 from checkpoint import create_key
 from ledger import main
+from signatures import generate
 
 
 class CliTest(unittest.TestCase):
@@ -112,6 +116,59 @@ class CliTest(unittest.TestCase):
         self.assertIn("chmod 600", err)
         self.key.chmod(0o600)
         self.assertEqual(self.run_cli("verify", "--checkpoint", token.strip(), "--key-file", self.key)[0], 0)
+
+    def test_private_signing_key_with_open_permissions_is_rejected(self):
+        openssl = os.environ.get("LEDGER_OPENSSL", "openssl")
+        version = subprocess.run([openssl, "version"], capture_output=True, text=True)
+        if os.name != "posix" or not version.stdout.startswith("OpenSSL 3."):
+            self.skipTest("OpenSSL 3 e permessi POSIX richiesti")
+        private = self.root / "ledger.private.der"
+        generate(private)
+        self.assertEqual(self.run_cli("checkpoint", "--private-key", private)[0], 0)
+        private.chmod(0o640)
+        status, out, err = self.run_cli("checkpoint", "--private-key", private)
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn("chmod 600", err)
+
+    def test_non_integer_height_is_an_integrity_error(self):
+        with sqlite3.connect(self.root / "ledger.db") as db:
+            rows = db.execute("SELECT * FROM blocks").fetchall()
+            db.execute("DROP TABLE blocks")
+            db.execute("CREATE TABLE blocks (height, created_ns, parent, payload, digest)")
+            db.executemany("INSERT INTO blocks VALUES (?, ?, ?, ?, ?)",
+                           [(float(row[0]), *row[1:]) for row in rows])
+        status, out, err = self.run_cli("verify")
+        self.assertEqual((status, out, err), (1, "", "Blocco non valido alla posizione 0.\n"))
+
+    def test_json_output(self):
+        def run(*args):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                status = main(["--db", str(self.root / "ledger.db"), "--json", *map(str, args)])
+            return status, [json.loads(line) for line in out.getvalue().splitlines()], err.getvalue()
+
+        status, (verified,), _ = run("verify")
+        self.assertEqual((status, verified["blocks"]), (0, 2))
+        status, blocks, _ = run("list")
+        self.assertEqual([block["height"] for block in blocks], [0, 1])
+        self.assertEqual(blocks[1]["digest"], verified["tip"])
+        self.assertEqual(blocks[0]["kind"], "payload")
+        self.assertIsInstance(blocks[0]["created_ns"], int)
+        status, (sealed,), _ = run("checkpoint", "--key-file", self.key)
+        self.assertEqual((sealed["blocks"], sealed["tip"]), (2, verified["tip"]))
+        options = ("--checkpoint", sealed["checkpoint"], "--key-file", self.key)
+        self.assertEqual(run("verify", *options)[1], [verified])
+        absent = self.write("absent", b"never stored")
+        status, found, _ = run("find", self.second, absent)
+        self.assertEqual(status, 1)
+        self.assertEqual(found, [{"file": self.second, "heights": [1]}, {"file": absent, "heights": []}])
+        status, (added,), _ = run("append", absent)
+        self.assertEqual(added["height"], 2)
+        status, out, err = run("verify", "--tip", verified["tip"])
+        self.assertEqual((status, out), (1, []))
+        self.assertEqual(list(json.loads(err)), ["error"])
+        status, (exported,), _ = run("export", "2", "--output", self.root / "copy")
+        self.assertEqual(exported, {"height": 2, "bytes": 12, "output": str(self.root / "copy")})
 
 
 if __name__ == "__main__":

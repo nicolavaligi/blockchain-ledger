@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import json
 import os
 import sqlite3
 import struct
@@ -89,7 +90,8 @@ def verify(db, expected_tip=None, *, anchor=None, allow_extension=False, fingerp
     with closing(rows):
         for height, created_ns, stored_parent, payload, digest, kind in rows:
             if (
-                height != count
+                type(height) is not int
+                or height != count
                 or type(created_ns) is not int
                 or created_ns < 0
                 or not isinstance(payload, bytes)
@@ -203,7 +205,7 @@ def parse_tip(text):
     return tip
 
 
-def report(db, args, count):
+def report(db, args, count, emit):
     """Answer a read command from the snapshot that verify just checked."""
     kind = "kind" if has_kind(db) else "0"
     if args.command == "list":
@@ -213,8 +215,10 @@ def report(db, args, count):
             " WHERE height >= ? ORDER BY height", (first,),
         )
         for height, created_ns, fingerprint, size, digest in rows:
-            print(f"height={height} created={timestamp(created_ns)} "
-                  f"kind={'sha256' if fingerprint else 'payload'} bytes={size} digest={digest.hex()}")
+            fields = dict(height=height, created=timestamp(created_ns),
+                          kind="sha256" if fingerprint else "payload", bytes=size, digest=digest.hex())
+            emit(" ".join(f"{name}={value}" for name, value in fields.items()),
+                 created_ns=created_ns, **fields)
     elif args.command == "export":
         row = db.execute("SELECT payload FROM blocks WHERE height = ?", (args.height,)).fetchone()
         if row is None:
@@ -222,7 +226,8 @@ def report(db, args, count):
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         with open(os.open(args.output, flags, 0o600), "wb") as stream:
             stream.write(row[0])
-        print(f"height={args.height} bytes={len(row[0])} output={args.output}")
+        emit(f"height={args.height} bytes={len(row[0])} output={args.output}",
+             height=args.height, bytes=len(row[0]), output=args.output)
     else:
         missing = False
         for path in args.files:
@@ -231,7 +236,9 @@ def report(db, args, count):
                 f" OR ({kind} = 1 AND payload = ?) ORDER BY height",
                 (read_payload(path), fingerprint_file(path)),
             ).fetchall()
-            print(f"{path}: " + (" ".join(f"height={height}" for height, in heights) or "assente"))
+            heights = [height for height, in heights]
+            emit(f"{path}: " + (" ".join(f"height={height}" for height in heights) or "assente"),
+                 file=path, heights=heights)
             missing = missing or not heights
         return 1 if missing else 0
     return 0
@@ -240,6 +247,7 @@ def report(db, args, count):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="ledger.db")
+    parser.add_argument("--json", action="store_true", help="Scrive un oggetto JSON per riga.")
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("append", help="Aggiunge un blocco per file.")
     add.add_argument("files", nargs="+")
@@ -279,6 +287,9 @@ def main(argv=None):
     if args.command == "list" and args.limit is not None and args.limit < 1:
         parser.error("--limit deve essere un intero positivo.")
 
+    def emit(text, **fields):
+        print(json.dumps(fields) if args.json else text)
+
     try:
         if args.command == "keygen":
             if args.private_key is not None:
@@ -293,14 +304,16 @@ def main(argv=None):
                 db.execute(SCHEMA)
                 height, digest = append(db, (load(path) for path in args.files),
                                         fingerprints=args.hash_only)
-            print(f"height={height} tip={digest.hex()}")
+            emit(f"height={height} tip={digest.hex()}", height=height, tip=digest.hex())
         elif args.command == "checkpoint":
             with closing(read_only(args.db)) as db:
+                db.execute("BEGIN")
                 count, digest = verify(db)
             if args.private_key is not None:
-                print(signatures.seal(count, digest, args.private_key))
+                token = signatures.seal(count, digest, args.private_key)
             else:
-                print(checkpoint.seal(count, digest, checkpoint.read_key(args.key_file)))
+                token = checkpoint.seal(count, digest, checkpoint.read_key(args.key_file))
+            emit(token, checkpoint=token, blocks=count, tip=digest.hex())
         else:
             anchor = get_anchor(parser, args)
             if args.command == "backup":
@@ -318,12 +331,15 @@ def main(argv=None):
                     count, digest = verify(db, tip, anchor=anchor,
                                            allow_extension=args.allow_extension, fingerprint=fingerprint)
                     if args.command != "verify":
-                        return report(db, args, count)
-                if fingerprint is not None:
+                        return report(db, args, count, emit)
+                if fingerprint is not None and not args.json:
                     print(f"fingerprint={fingerprint.hex()}")
-            print(f"blocks={count} tip={digest.hex() if digest else '-'}")
+            fields = dict(blocks=count, tip=digest.hex() if digest else None)
+            if args.command == "verify" and fingerprint is not None:
+                fields["fingerprint"] = fingerprint.hex()
+            emit(f"blocks={count} tip={fields['tip'] or '-'}", **fields)
     except (OSError, ValueError, sqlite3.Error, TimeoutExpired) as error:
-        print(error, file=sys.stderr)
+        print(json.dumps({"error": str(error)}) if args.json else error, file=sys.stderr)
         return 1
     return 0
 

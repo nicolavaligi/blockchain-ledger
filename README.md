@@ -37,6 +37,18 @@ prima di rispondere e accettano le opzioni di fiducia di `verify` (`--tip`,
 `--checkpoint`, `--signed-checkpoint`, `--allow-extension`). Un registro
 alterato produce quindi un errore al posto dei dati.
 
+## Uscita JSON
+
+```sh
+python3 ledger.py --db registro.db --json list
+python3 ledger.py --db registro.db --json checkpoint --key-file /percorso/protetto/registro.key
+```
+
+Con `--json`, posto prima del comando, ogni risultato è un oggetto JSON su una
+riga: `list` ne scrive uno per blocco, `find` uno per file. `checkpoint`
+restituisce il token insieme a `blocks` e `tip`. Gli errori vanno su standard
+error come `{"error": "..."}` e i codici di uscita restano invariati.
+
 ## Test e benchmark
 
 ```sh
