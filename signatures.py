@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from checkpoint import BODY
+from checkpoint import BODY, require_private
 
 DOMAIN = b"blockchain-ledger:ed25519:v1\0"
 PRIVATE_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
@@ -40,6 +40,8 @@ def export_public(private_path, public_path):
 def validated_key(path, prefix, directory):
     size = len(prefix) + 32
     with open(path, "rb") as stream:
+        if prefix == PRIVATE_PREFIX:
+            require_private(stream)
         data = stream.read(size + 1)
     if len(data) != size or not data.startswith(prefix):
         raise ValueError("Chiave Ed25519 DER non valida.")
@@ -66,9 +68,10 @@ def seal(count, tip, key_path):
 
 def unseal(token, key_path):
     size = BODY.size + SIGNATURE_SIZE
-    if len(token) != 2 * size:
-        raise ValueError("Formato del checkpoint Ed25519 non valido.")
-    raw = bytes.fromhex(token)
+    try:
+        raw = bytes.fromhex(token) if len(token) == 2 * size else b""
+    except ValueError:
+        raw = b""
     if len(raw) != size:
         raise ValueError("Formato del checkpoint Ed25519 non valido.")
     body, signature = raw[:BODY.size], raw[BODY.size:]

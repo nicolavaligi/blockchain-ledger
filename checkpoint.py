@@ -18,8 +18,15 @@ def create_key(path):
         stream.write(key)
 
 
+def require_private(stream):
+    """Reject a secret that group or other users can access."""
+    if os.name == "posix" and os.fstat(stream.fileno()).st_mode & 0o077:
+        raise ValueError("La chiave deve essere accessibile solo al proprietario (chmod 600).")
+
+
 def read_key(path):
     with open(path, "rb") as stream:
+        require_private(stream)
         key = stream.read(KEY_SIZE + 1)
     if len(key) != KEY_SIZE:
         raise ValueError("La chiave deve contenere esattamente 32 byte.")
@@ -34,9 +41,10 @@ def seal(count, tip, key):
 
 
 def unseal(token, key):
-    if len(token) != 2 * TOKEN_SIZE:
-        raise ValueError("Formato del checkpoint non valido.")
-    raw = bytes.fromhex(token)
+    try:
+        raw = bytes.fromhex(token) if len(token) == 2 * TOKEN_SIZE else b""
+    except ValueError:
+        raw = b""
     if len(raw) != TOKEN_SIZE:
         raise ValueError("Formato del checkpoint non valido.")
     body, mac = raw[:BODY.size], raw[BODY.size:]

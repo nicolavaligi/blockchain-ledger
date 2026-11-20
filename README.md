@@ -18,6 +18,25 @@ l'hash finale (`tip`). Salvalo in uno spazio fidato separato e passalo come
 `--tip HASH` a `verify` per verificare lo stato esatto a cui corrisponde.
 `verify` restituisce codice 1 per gli errori di integrità e di accesso.
 
+## Lettura
+
+```sh
+python3 ledger.py --db registro.db list --limit 20
+python3 ledger.py --db registro.db export 0 --output copia.txt
+python3 ledger.py --db registro.db find documento.txt
+```
+
+`list` mostra altezza, data UTC, tipo (`payload` o `sha256`), dimensione e
+digest di ogni blocco. `export` estrae il payload di un blocco in un file nuovo
+con permessi `0600` e rifiuta di sovrascrivere un file esistente. `find` indica
+a quali altezze è registrato ciascun file, come contenuto esatto oppure come
+impronta `--hash-only`, e restituisce codice 1 se almeno uno è assente.
+
+I tre comandi verificano l'intera catena nella stessa istantanea di lettura
+prima di rispondere e accettano le opzioni di fiducia di `verify` (`--tip`,
+`--checkpoint`, `--signed-checkpoint`, `--allow-extension`). Un registro
+alterato produce quindi un errore al posto dei dati.
+
 ## Test e benchmark
 
 ```sh
@@ -127,3 +146,29 @@ controlla l'integrità di SQLite e della catena prima di rendere disponibile
 il file finale. La destinazione deve essere nuova e il suo filesystem deve
 supportare i collegamenti fisici. Conserva backup e checkpoint in posizioni
 distinte e protette. La copia include tutti i dati presenti nel database.
+
+## Protezione delle chiavi
+
+Sui sistemi POSIX la lettura della chiave HMAC e della chiave privata Ed25519
+fallisce se il file è accessibile al gruppo o ad altri utenti. Ripristina i
+permessi con `chmod 600`.
+
+## Dati personali
+
+Il registro è append-only: un blocco non si può cancellare né rettificare senza
+invalidare la catena, e i payload sono conservati in chiaro. Per i documenti
+che contengono dati personali usa quindi `append --hash-only` e conserva il
+documento altrove, dove cancellazione e rettifica restano possibili (artt. 16 e
+17 GDPR). L'impronta di un documento prevedibile può essere ricostruita per
+tentativi da chi legge il registro. Database, chiavi, backup e file esportati
+restano sul disco locale: il programma lavora senza rete. I messaggi di errore
+riportano percorsi e posizioni dei blocchi, mai il contenuto dei payload.
+
+## Scelte tecniche
+
+Python con la libreria standard: SHA-256, HMAC e SQLite sono già inclusi, quindi
+il codice si legge per intero e gira senza installazioni. SQLite fornisce
+transazioni atomiche e istantanee di lettura coerenti, che un file piatto
+richiederebbe di reimplementare. Ed25519 è delegato a OpenSSL 3 perché la
+libreria standard non offre firme asimmetriche. I test girano in CI su Python
+3.10, 3.12 e 3.14.

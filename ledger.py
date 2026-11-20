@@ -8,6 +8,7 @@ import struct
 import sys
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import TimeoutExpired
 from tempfile import TemporaryDirectory
@@ -182,7 +183,61 @@ def read_payload(path):
         return stream.read(MAX_PAYLOAD + 1)
 
 
-def main():
+def timestamp(created_ns):
+    try:
+        moment = datetime.fromtimestamp(created_ns // 10**9, timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return f"{created_ns}ns"
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_tip(text):
+    if text is None:
+        return None
+    try:
+        tip = bytes.fromhex(text)
+    except ValueError:
+        tip = b""
+    if len(tip) != 32:
+        raise ValueError("L'hash finale SHA-256 deve contenere 32 byte esadecimali.")
+    return tip
+
+
+def report(db, args, count):
+    """Answer a read command from the snapshot that verify just checked."""
+    kind = "kind" if has_kind(db) else "0"
+    if args.command == "list":
+        first = 0 if args.limit is None else max(count - args.limit, 0)
+        rows = db.execute(
+            f"SELECT height, created_ns, {kind}, length(payload), digest FROM blocks"
+            " WHERE height >= ? ORDER BY height", (first,),
+        )
+        for height, created_ns, fingerprint, size, digest in rows:
+            print(f"height={height} created={timestamp(created_ns)} "
+                  f"kind={'sha256' if fingerprint else 'payload'} bytes={size} digest={digest.hex()}")
+    elif args.command == "export":
+        row = db.execute("SELECT payload FROM blocks WHERE height = ?", (args.height,)).fetchone()
+        if row is None:
+            raise ValueError(f"Nessun blocco all'altezza {args.height}.")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        with open(os.open(args.output, flags, 0o600), "wb") as stream:
+            stream.write(row[0])
+        print(f"height={args.height} bytes={len(row[0])} output={args.output}")
+    else:
+        missing = False
+        for path in args.files:
+            heights = db.execute(
+                f"SELECT height FROM blocks WHERE ({kind} = 0 AND payload = ?)"
+                f" OR ({kind} = 1 AND payload = ?) ORDER BY height",
+                (read_payload(path), fingerprint_file(path)),
+            ).fetchall()
+            print(f"{path}: " + (" ".join(f"height={height}" for height, in heights) or "assente"))
+            missing = missing or not heights
+        return 1 if missing else 0
+    return 0
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="ledger.db")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -210,7 +265,19 @@ def main():
     restore.add_argument("backup")
     for command in (backup, restore):
         authentication(command, required=True)
-    args = parser.parse_args()
+    listing = commands.add_parser("list", help="Elenca i blocchi verificati.")
+    listing.add_argument("--limit", type=int, help="Mostra solo gli ultimi N blocchi.")
+    export = commands.add_parser("export", help="Estrae il payload di un blocco.")
+    export.add_argument("height", type=int)
+    export.add_argument("--output", required=True, help="File da creare, mai sovrascritto.")
+    find = commands.add_parser("find", help="Cerca contenuto o impronta dei file.")
+    find.add_argument("files", nargs="+")
+    for command in (listing, export, find):
+        authentication(command, include_tip=True)
+        command.add_argument("--allow-extension", action="store_true", help="Accetta blocchi successivi.")
+    args = parser.parse_args(argv)
+    if args.command == "list" and args.limit is not None and args.limit < 1:
+        parser.error("--limit deve essere un intero positivo.")
 
     try:
         if args.command == "keygen":
@@ -243,13 +310,15 @@ def main():
             else:
                 if args.allow_extension and anchor is None:
                     parser.error("--allow-extension richiede un checkpoint autenticato.")
-                tip = bytes.fromhex(args.tip) if args.tip is not None else None
-                if tip is not None and len(tip) != 32:
-                    raise ValueError("L'hash finale SHA-256 deve contenere 32 byte.")
-                fingerprint = fingerprint_file(args.file) if args.file is not None else None
+                tip = parse_tip(args.tip)
+                path = getattr(args, "file", None)
+                fingerprint = fingerprint_file(path) if path is not None else None
                 with closing(read_only(args.db)) as db:
+                    db.execute("BEGIN")
                     count, digest = verify(db, tip, anchor=anchor,
                                            allow_extension=args.allow_extension, fingerprint=fingerprint)
+                    if args.command != "verify":
+                        return report(db, args, count)
                 if fingerprint is not None:
                     print(f"fingerprint={fingerprint.hex()}")
             print(f"blocks={count} tip={digest.hex() if digest else '-'}")
